@@ -1,11 +1,14 @@
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
 from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
+
+PIXEL_TO_MM = 0.05
 
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
@@ -99,8 +102,13 @@ class DINOv2Config:
     # Inference
     tta_transforms: int = 8  # Test-time augmentation
     mc_dropout_samples: int = 10  # Monte Carlo dropout
-    confidence_threshold: float = 0.35
-    min_defect_area: int = 100  # Minimum defect size in pixels
+    confidence_threshold: float = 0.25
+    min_defect_area: int = 50  # Minimum defect size in pixels
+    pixel_to_mm: float = PIXEL_TO_MM
+    backup_frequency: int = 5  # Every N epochs, backup best model to Drive
+    
+    # Output backup (auto-detected: Colab Drive or Kaggle Output)
+    drive_results_dir: Path = field(init=False)
     
     # Defect taxonomy (hierarchical mapping)
     defect_hierarchy: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -116,6 +124,17 @@ class DINOv2Config:
         self.input_dir = self._resolve_input_dir(self.input_dir)
         print(f"✅ Found data root at: {self.input_dir}")
 
+        # Auto-detect environment based on actual mount status
+        if Path('/content/drive').exists():
+            self.is_colab = True
+            self.drive_results_dir = Path("/content/drive/MyDrive/dinov2_results")
+        else:
+            self.is_colab = False
+            self.drive_results_dir = Path("/kaggle/working/deploy")
+            
+        print(f"✅ Environment: {'Colab (Drive Mounted)' if self.is_colab else 'Kaggle/Local (Notebook Output)'}")
+        print(f"📂 Saving results to: {self.drive_results_dir}")
+
         # Create directories
         self.combined_dir = self.working_dir / "data" / "combined"
         self.results_dir = self.working_dir / "results"
@@ -124,6 +143,8 @@ class DINOv2Config:
         
         for d in [self.combined_dir, self.results_dir, self.models_dir, self.viz_dir]:
             d.mkdir(parents=True, exist_ok=True)
+        
+        self.drive_results_dir.mkdir(parents=True, exist_ok=True)
         
         # Source directories
         self.black_dir = self.input_dir / "black"
@@ -1226,6 +1247,16 @@ class DINOv2Trainer:
             if (epoch + 1) % 10 == 0:
                 self.save_checkpoint(epoch, val_losses)
             
+            # Periodic backup of best model to Drive/Output
+            if (epoch + 1) % self.config.backup_frequency == 0:
+                best_path = self.config.models_dir / 'best_dinov2_model.pth'
+                if best_path.exists():
+                    print(f"  ☁️  Syncing best model to persistent storage (Epoch {epoch+1})...")
+                    try:
+                        shutil.copy(str(best_path), str(self.config.drive_results_dir / 'best_dinov2_model.pth'))
+                    except Exception as e:
+                        print(f"  ⚠️  Backup failed: {e}")
+
             self.train_losses.append(train_losses)
             self.val_losses.append(val_losses)
         
@@ -1260,6 +1291,7 @@ class DINOv2Inference:
         self.config = config
         self.taxonomy = taxonomy
         self.device = config.device
+        self.px_to_mm = config.pixel_to_mm
         
         self.model.to(self.device)
         self.model.eval()
@@ -1305,11 +1337,94 @@ class DINOv2Inference:
         
         return processed
     
+    def _extract(self, predictions, uncertainty):
+        mm2_per_px = self.px_to_mm ** 2
+        dets = []
+        for cls in range(1, self.taxonomy.get_num_classes() + 1):
+            m = (predictions == cls).astype(np.uint8)
+            nl, labels, stats, cents = cv2.connectedComponentsWithStats(m, 8)
+            for i in range(1, nl):
+                area_px = int(stats[i, cv2.CC_STAT_AREA])
+                x, y, bw, bh = stats[i, cv2.CC_STAT_LEFT:cv2.CC_STAT_HEIGHT + 1]
+                dm = (labels == i).astype(np.uint8)
+                au = float(uncertainty[dm > 0].mean()) if dm.sum() > 0 else 0.0
+                contours, _ = cv2.findContours(dm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    dets.append({
+                        'class_id': cls - 1,
+                        'class_name': self.taxonomy.id_to_class[cls - 1],
+                        'bbox': [int(x), int(y), int(x + bw), int(y + bh)],
+                        'area_pixels': area_px,
+                        'area_mm2': round(area_px * mm2_per_px, 4),
+                        'num_pixels': area_px,
+                        'centroid': [round(c, 2) for c in cents[i].tolist()],
+                        'uncertainty': round(au, 4),
+                        'contour': contours[0],
+                    })
+        return dets
+
+    def _class_analysis(self, detections, img_h, img_w):
+        total_img_px = img_h * img_w
+        mm2_per_px   = self.px_to_mm ** 2
+        total_defect_px = sum(d['area_pixels'] for d in detections)
+
+        analysis = {}
+        for cls_id in range(self.taxonomy.get_num_classes()):
+            cls_name = self.taxonomy.id_to_class[cls_id]
+            cls_dets = [d for d in detections if d['class_id'] == cls_id]
+
+            if not cls_dets:
+                analysis[cls_name] = {
+                    'count': 0, 'total_area_pixels': 0, 'total_area_mm2': 0.0,
+                    'area_percentage_of_image': 0.0,
+                    'area_percentage_of_all_defects': 0.0, 'instances': [],
+                }
+                continue
+
+            cls_area_px = sum(d['area_pixels'] for d in cls_dets)
+            analysis[cls_name] = {
+                'count': len(cls_dets),
+                'total_area_pixels': cls_area_px,
+                'total_area_mm2': round(cls_area_px * mm2_per_px, 4),
+                'area_percentage_of_image': round(cls_area_px / total_img_px * 100, 4),
+                'area_percentage_of_all_defects': round(
+                    cls_area_px / total_defect_px * 100, 4) if total_defect_px > 0 else 0.0,
+                'instances': [
+                    {
+                        'instance_id': idx + 1,
+                        'bbox': d['bbox'],
+                        'area_pixels': d['area_pixels'],
+                        'area_mm2': d['area_mm2'],
+                        'centroid': d['centroid'],
+                        'uncertainty': d['uncertainty'],
+                    }
+                    for idx, d in enumerate(cls_dets)
+                ],
+            }
+        return analysis
+
+    def _summary(self, detections, img_h, img_w):
+        total_img_px   = img_h * img_w
+        mm2_per_px     = self.px_to_mm ** 2
+        total_def_px   = sum(d['area_pixels'] for d in detections)
+        return {
+            'total_defects': len(detections),
+            'total_defect_area_pixels': total_def_px,
+            'total_defect_area_mm2': round(total_def_px * mm2_per_px, 4),
+            'defect_area_percentage': round(total_def_px / total_img_px * 100, 4) if total_img_px > 0 else 0.0,
+        }
+
+    def _generate_heatmap(self, uncertainty):
+        unc_norm = np.clip(uncertainty / (uncertainty.max() + 1e-8), 0, 1)
+        unc_u8   = (unc_norm * 255).astype(np.uint8)
+        heatmap  = cv2.applyColorMap(unc_u8, cv2.COLORMAP_JET)
+        return heatmap
+
     def predict(self, image: np.ndarray, use_tta: bool = True) -> Dict:
+        h, w = image.shape[:2]
         if use_tta:
             predictions, uncertainty = self.predict_with_tta(image)
         else:
-            h, w = image.shape[:2]
             transform = DINOv2Augmentation.get_val_transforms(self.config.image_size)
             image_tensor = transform(image=image)['image'].unsqueeze(0).to(self.device)
             
@@ -1320,46 +1435,26 @@ class DINOv2Inference:
             predictions = torch.argmax(probs, dim=1).cpu().numpy()[0]
             uncertainty = np.zeros_like(predictions, dtype=np.float32)
         
-        predictions = self.post_process(predictions)
-        detections = self.extract_detections(predictions, uncertainty)
-        visualization = self.visualize(image, predictions, uncertainty, detections)
-        
+        predictions    = self.post_process(predictions)
+        detections     = self._extract(predictions, uncertainty)
+        class_analysis = self._class_analysis(detections, h, w)
+        summary        = self._summary(detections, h, w)
+        heatmap        = self._generate_heatmap(uncertainty)
+        viz            = self._visualize(image, predictions, uncertainty, detections)
+
         return {
             'predictions': predictions,
             'uncertainty': uncertainty,
             'detections': detections,
-            'visualization': visualization
+            'class_analysis': class_analysis,
+            'summary': summary,
+            'heatmap': heatmap,
+            'visualization': viz,
+            'image_height': h,
+            'image_width': w,
         }
     
-    def extract_detections(self, predictions: np.ndarray, uncertainty: np.ndarray) -> List[Dict]:
-        detections = []
-        
-        for cls in range(1, self.taxonomy.get_num_classes() + 1):
-            mask = (predictions == cls).astype(np.uint8)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-            
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                x, y, w, h = stats[i, cv2.CC_STAT_LEFT:cv2.CC_STAT_HEIGHT+1]
-                defect_mask = (labels == i).astype(np.uint8)
-                avg_uncertainty = uncertainty[defect_mask > 0].mean() if defect_mask.sum() > 0 else 0.0
-                
-                contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if len(contours) > 0:
-                    detections.append({
-                        'class_id': cls - 1,
-                        'class_name': self.taxonomy.id_to_class[cls - 1],
-                        'bbox': [x, y, x + w, y + h],
-                        'area_pixels': int(area),
-                        'centroid': centroids[i].tolist(),
-                        'uncertainty': float(avg_uncertainty),
-                        'contour': contours[0]
-                    })
-        
-        return detections
-    
-    def visualize(self, image: np.ndarray, predictions: np.ndarray,
+    def _visualize(self, image: np.ndarray, predictions: np.ndarray,
                   uncertainty: np.ndarray, detections: List[Dict]) -> np.ndarray:
         h, w = image.shape[:2]
         canvas = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
@@ -1371,7 +1466,6 @@ class DINOv2Inference:
         
         canvas[:h, :w] = image_rgb
         
-        # Segmentation overlay
         overlay = image_rgb.copy()
         colors = [(0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
         
@@ -1381,24 +1475,21 @@ class DINOv2Inference:
         
         canvas[:h, w:2*w] = cv2.addWeighted(image_rgb, 0.5, overlay, 0.5, 0)
         
-        # Detections
         detection_vis = image_rgb.copy()
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             color = colors[det['class_id'] + 1]
             cv2.rectangle(detection_vis, (x1, y1), (x2, y2), color, 2)
-            label = f"{det['class_name']} ({det['uncertainty']:.2f})"
+            label = f"{det['class_name']} ({det['area_mm2']:.2f}mm2)"
             cv2.putText(detection_vis, label, (x1, max(y1 - 5, 15)),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         canvas[h:2*h, :w] = detection_vis
         
-        # Uncertainty
         uncertainty_norm = (uncertainty * 255).astype(np.uint8)
         uncertainty_color = cv2.applyColorMap(uncertainty_norm, cv2.COLORMAP_JET)
         canvas[h:2*h, w:2*w] = uncertainty_color
         
-        # Labels
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(canvas, "Original", (10, 30), font, 1, (255, 255, 255), 2)
         cv2.putText(canvas, "Segmentation", (w + 10, 30), font, 1, (255, 255, 255), 2)
@@ -1414,6 +1505,15 @@ class DINOv2Inference:
 
 def main():
     """Execute DINOv2 defect detection pipeline"""
+    
+    # Try mounting Drive if on Colab (with robust error handling)
+    try:
+        from google.colab import drive
+        print("Mounting Google Drive...")
+        drive.mount('/content/drive')
+    except Exception as e:
+        print(f"⚠️ Drive mount skipped: {e}")
+        print("   Continuing with local/Kaggle storage.")
     
     config = DINOv2Config()
     taxonomy = DefectTaxonomy(config.defect_hierarchy)
@@ -1492,52 +1592,88 @@ def main():
         
         results = inference.predict(image, use_tta=True)
         
-        viz_path = config.viz_dir / f"{img_path.stem}_dinov2.jpg"
-        cv2.imwrite(str(viz_path), cv2.cvtColor(results['visualization'], cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(config.viz_dir / f"{img_path.stem}_dinov2.jpg"),
+                    cv2.cvtColor(results['visualization'], cv2.COLOR_RGB2BGR))
+        
+        cv2.imwrite(str(config.viz_dir / f"{img_path.stem}_heatmap.jpg"),
+                    results['heatmap'])
+        
+        h = results['image_height']
+        w = results['image_width']
+        total_px   = h * w
+        mm2_per_px = config.pixel_to_mm ** 2
         
         report = {
             'image_path': str(img_path),
-            'num_defects': len(results['detections']),
-            'detections': [
-                {
-                    'class_name': d['class_name'],
-                    'bbox': d['bbox'],
-                    'area_pixels': d['area_pixels'],
-                    'uncertainty': d['uncertainty']
-                }
-                for d in results['detections']
-            ]
+            'image_dimensions': {'width': w, 'height': h},
+            'total_image_area_pixels': total_px,
+            'total_image_area_mm2': round(total_px * mm2_per_px, 4),
+            'pixel_to_mm': config.pixel_to_mm,
+            'summary': results['summary'],
+            'class_analysis': results['class_analysis'],
         }
         
         json_path = config.results_dir / f"{img_path.stem}_dinov2_report.json"
         with open(json_path, 'w') as f:
             json.dump(report, f, indent=2)
         
-        print(f"    {len(results['detections'])} defects detected")
+        s = results['summary']
+        print(f"    {s['total_defects']} defects | "
+              f"{s['total_defect_area_pixels']} px | "
+              f"{s['total_defect_area_mm2']} mm² | "
+              f"{s['defect_area_percentage']:.2f}% of image")
     
-    # Export
+    # Deployment bundle (TorchScript — hides architecture)
     print("\n" + "="*80)
-    print("STEP 6: EXPORT")
+    print("STEP 6: DEPLOYMENT BUNDLE")
     print("="*80)
     
     model.eval()
-    dummy_input = torch.randn(1, 3, config.image_size, config.image_size).to(config.device)
+    dummy = torch.randn(1, 3, config.image_size, config.image_size).to(config.device)
+    with torch.no_grad():
+        traced = torch.jit.trace(model, dummy)
+
+    meta = json.dumps({
+        'class_names': taxonomy.unified_classes,
+        'num_classes': taxonomy.get_num_classes(),
+        'image_size': config.image_size,
+        'pixel_to_mm': config.pixel_to_mm,
+        'min_defect_area': config.min_defect_area,
+    })
+
+    deploy_path = config.models_dir / 'model.pt'
+    torch.jit.save(traced, str(deploy_path), _extra_files={'config.json': meta})
+    print(f"✅ Deployment model saved: {deploy_path}")
     
-    onnx_path = config.models_dir / 'dinov2_defect_detector.onnx'
-    torch.onnx.export(
-        model,
-        dummy_input,
-        str(onnx_path),
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}},
-        opset_version=14
-    )
+    # Copy key outputs to /kaggle/working/deploy/ for easy download
+    print("\n📦 Copying outputs to Kaggle output directory...")
+    shutil.copy(str(deploy_path), str(config.drive_results_dir / 'model.pt'))
     
-    print(f"✅ ONNX: {onnx_path}")
-    print(f"\n📦 Models: {config.models_dir}")
-    print(f"📊 Results: {config.results_dir}")
-    print(f"🖼️  Viz: {config.viz_dir}")
+    # Copy best checkpoint too
+    best_ckpt = config.models_dir / 'best_dinov2_model.pth'
+    if best_ckpt.exists():
+        shutil.copy(str(best_ckpt), str(config.drive_results_dir / 'best_dinov2_model.pth'))
+    
+    # Copy all JSON reports
+    for jf in config.results_dir.glob('*.json'):
+        shutil.copy(str(jf), str(config.drive_results_dir / jf.name))
+    
+    # Copy visualizations
+    viz_deploy = config.drive_results_dir / 'visualizations'
+    viz_deploy.mkdir(parents=True, exist_ok=True)
+    for vf in config.viz_dir.glob('*.jpg'):
+        shutil.copy(str(vf), str(viz_deploy / vf.name))
+    
+    print(f"✅ All outputs copied to: {config.drive_results_dir}")
+    print(f"   Download from Kaggle Output after notebook finishes.\n")
+    
+    print("=" * 80)
+    print("🏁 ALL DONE!")
+    print(f"   📦 Deploy  : {config.drive_results_dir / 'model.pt'}")
+    print(f"   📊 Results : {config.results_dir}")
+    print(f"   🖼️  Viz    : {config.viz_dir}")
+    print(f"   💾 Output  : {config.drive_results_dir}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
