@@ -1,23 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║           ULTIMATE DOOR DEFECT DETECTION SYSTEM v2.0                         ║
-║           State-of-the-Art Industrial Computer Vision Pipeline               ║
-║                                                                              ║
-║  Features:                                                                   ║
-║  • Multi-scale attention-based architecture (SegFormer + EfficientNet)       ║
-║  • Uncertainty quantification with Monte Carlo Dropout                       ║
-║  • Test-time augmentation for robust predictions                            ║
-║  • Advanced augmentation with defect synthesis                               ║
-║  • Per-class calibrated confidence thresholds                                ║
-║  • Camera calibration with distortion correction                             ║
-║  • Active learning integration                                               ║
-║  • Grad-CAM interpretability                                                 ║
-║  • Production-ready deployment with TensorRT optimization                    ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
-
 import subprocess
 import sys
 from pathlib import Path
@@ -27,22 +7,20 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# Install dependencies
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-# Uninstall tracking dependencies
 for pkg in ["wandb", "ray"]:
     subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", pkg],
                     stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-# Install core packages
 for pkg in ["timm", "segmentation-models-pytorch", "albumentations", 
             "opencv-python-headless", "efficientnet-pytorch", "grad-cam", 
             "onnx", "onnxruntime", "scipy"]:
     install(pkg)
 
 import torch
+import torch.hub
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -61,64 +39,39 @@ import segmentation_models_pytorch as smp
 import timm
 from scipy.ndimage import binary_opening, binary_closing
 from scipy.optimize import linear_sum_assignment
-
-# Disable wandb
 os.environ['WANDB_DISABLED'] = 'true'
 os.environ['WANDB_MODE'] = 'disabled'
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                              CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class Config:
-    """Centralized configuration with best practices"""
-    
-    # Dataset paths
-    dataset_name: str = "data-bwg"
-    input_dir: Path = Path(f"/kaggle/input/data-bwg")
+    dataset_name: str = "door-defect-data"
+    input_dir: Path = Path("/kaggle/input/door-defect-data/data")
     working_dir: Path = Path("/kaggle/working")
-    
-    # Data splits
     train_split: float = 0.75
     val_split: float = 0.15
     test_split: float = 0.10
-    
-    # Model architecture
-    encoder_name: str = "tu-efficientnet_b4"  # timm backbone
+    encoder_name: str = "dinov2_vitb14"
     encoder_weights: str = "imagenet"
-    architecture: str = "UnetPlusPlus"  # UnetPlusPlus, DeepLabV3Plus, FPN
-    
-    # Training hyperparameters
-    image_size: int = 1024
+    architecture: str = "UnetPlusPlus"
+    image_size: int = 518
     batch_size: int = 4
     num_epochs: int = 150
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
-    
-    # Advanced training
-    use_amp: bool = True  # Automatic Mixed Precision
-    accumulation_steps: int = 4  # Gradient accumulation
-    ema_decay: float = 0.999  # Exponential Moving Average
+    use_amp: bool = True
+    accumulation_steps: int = 4
+    ema_decay: float = 0.999
     warmup_epochs: int = 10
-    
-    # Augmentation
     aug_multiplier: int = 3
     rare_class_multiplier: int = 8
     use_defect_synthesis: bool = True
-    
-    # Inference
-    tta_transforms: int = 8  # Test-time augmentation
-    mc_dropout_samples: int = 10  # Monte Carlo dropout for uncertainty
+    tta_transforms: int = 8
+    mc_dropout_samples: int = 10
     confidence_threshold: float = 0.35
     nms_iou_threshold: float = 0.5
-    
-    # Camera calibration
-    calibration_pattern_size: Tuple[int, int] = (9, 6)  # Checkerboard
+    calibration_pattern_size: Tuple[int, int] = (9, 6)
     calibration_square_size_mm: float = 25.0
-    
-    # Defect taxonomy
     defect_hierarchy: Dict[str, List[str]] = field(default_factory=lambda: {
         'scratch': ['Scratch', 'scratch', 'scratch_deep', 'horizontal_scratch'],
         'chipping': ['CHIPPING', 'chip', 'edge_damage'],
@@ -126,8 +79,6 @@ class Config:
         'rundown': ['RunDown', 'rundown', 'drip', 'sag'],
         'texture_defect': ['orange peel', 'orange_peel', 'peel'],
     })
-    
-    # Per-class confidence thresholds (calibrated)
     class_thresholds: Dict[str, float] = field(default_factory=lambda: {
         'scratch': 0.40,
         'chipping': 0.35,
@@ -135,8 +86,6 @@ class Config:
         'rundown': 0.30,
         'texture_defect': 0.38,
     })
-    
-    # Weights for loss function
     loss_weights: Dict[str, float] = field(default_factory=lambda: {
         'focal': 0.5,
         'dice': 0.3,
@@ -144,7 +93,6 @@ class Config:
     })
     
     def __post_init__(self):
-        # Create directories
         self.combined_dir = self.working_dir / "data" / "combined"
         self.results_dir = self.working_dir / "results"
         self.models_dir = self.working_dir / "models"
@@ -155,50 +103,54 @@ class Config:
                   self.viz_dir, self.calib_dir]:
             d.mkdir(parents=True, exist_ok=True)
         
-        # Source directories
+        self.input_dir = self._resolve_input_dir(self.input_dir)
         self.black_dir = self.input_dir / "black"
         self.white_dir = self.input_dir / "white"
         self.glossy_dir = self.input_dir / "glossy"
         
-        # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        print("═" * 80)
         print("🚀 ULTIMATE DOOR DEFECT DETECTION SYSTEM v2.0")
-        print("═" * 80)
         print(f"Device: {self.device}")
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         print(f"Working Directory: {self.working_dir}")
+        print(f"Input Directory:   {self.input_dir}")
         print()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                         SEMANTIC DEFECT TAXONOMY
-# ═══════════════════════════════════════════════════════════════════════════
-
-class DefectTaxonomy:
-    """Hierarchical defect classification system"""
     
+    @staticmethod
+    def _resolve_input_dir(initial_dir: Path) -> Path:
+        for door in ['black', 'white', 'glossy']:
+            if (initial_dir / door / 'train' / 'images').exists():
+                print(f"✅ Found data root at: {initial_dir}")
+                return initial_dir
+        kaggle_input = Path("/kaggle/input")
+        if kaggle_input.exists():
+            for candidate in sorted(kaggle_input.rglob("*")):
+                if not candidate.is_dir():
+                    continue
+                for door in ['black', 'white', 'glossy']:
+                    if (candidate / door / 'train' / 'images').exists():
+                        print(f"🔍 Auto-detected data root at: {candidate}")
+                        return candidate
+        print(f"⚠️  Could not auto-detect data root, using: {initial_dir}")
+        return initial_dir
+
+class DefectTaxonomy:    
     def __init__(self, hierarchy: Dict[str, List[str]]):
         self.hierarchy = hierarchy
         self.unified_classes = list(hierarchy.keys())
         self.class_to_id = {cls: idx for idx, cls in enumerate(self.unified_classes)}
         self.id_to_class = {idx: cls for cls, idx in self.class_to_id.items()}
-        
-        # Build reverse mapping
         self.variant_to_unified = {}
         for unified, variants in hierarchy.items():
             for variant in variants:
                 self.variant_to_unified[variant.lower()] = unified
     
     def map_to_unified(self, variant_name: str) -> str:
-        """Map any variant to unified class name"""
         return self.variant_to_unified.get(variant_name.lower(), variant_name)
     
     def get_class_id(self, class_name: str) -> int:
-        """Get unified class ID"""
         unified = self.map_to_unified(class_name)
         return self.class_to_id.get(unified, -1)
     
@@ -210,39 +162,26 @@ class DefectTaxonomy:
         for unified, variants in self.hierarchy.items():
             print(f"  {self.class_to_id[unified]:2d}. {unified:20s} ← {', '.join(variants)}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                      ADVANCED DATA AUGMENTATION
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DefectAugmentation:
-    """State-of-the-art augmentation pipeline for industrial defect detection"""
-    
     @staticmethod
     def get_train_transforms(image_size: int = 1024):
-        """Training augmentation with defect-preserving transforms"""
         return A.Compose([
-            # Geometric transforms (preserve defect shape)
             A.RandomRotate90(p=0.5),
-            A.Flip(p=0.5),
-            A.ShiftScaleRotate(
-                shift_limit=0.0625,
-                scale_limit=0.15,
-                rotate_limit=15,
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),
+            A.Affine(
+                translate_percent={"x": (-0.0625, 0.0625), "y": (-0.0625, 0.0625)},
+                scale=(0.85, 1.15),
+                rotate=(-15, 15),
                 border_mode=cv2.BORDER_REFLECT_101,
                 p=0.7
             ),
-            
-            # Elastic deformation (simulate surface warping)
             A.ElasticTransform(
                 alpha=50,
                 sigma=5,
-                alpha_affine=5,
                 border_mode=cv2.BORDER_REFLECT_101,
                 p=0.2
             ),
-            
-            # Lighting conditions (critical for glossy surfaces)
             A.OneOf([
                 A.RandomBrightnessContrast(
                     brightness_limit=0.3,
@@ -258,60 +197,29 @@ class DefectAugmentation:
                     p=1.0
                 ),
             ], p=0.9),
-            
-            # Environmental effects
             A.OneOf([
-                A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
-                A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
-                A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=1.0),
+                A.GaussNoise(std_range=(0.03, 0.12), p=1.0),
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
             ], p=0.4),
-            
-            # Blur (motion, defocus from camera)
             A.OneOf([
                 A.MotionBlur(blur_limit=7, p=1.0),
                 A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                 A.MedianBlur(blur_limit=5, p=1.0),
             ], p=0.3),
-            
-            # Simulate lighting artifacts on glossy surfaces
-            A.RandomSunFlare(
-                flare_roi=(0, 0, 1, 0.5),
-                angle_lower=0,
-                angle_upper=1,
-                num_flare_circles_lower=1,
-                num_flare_circles_upper=2,
-                src_radius=100,
+            A.RandomBrightnessContrast(
+                brightness_limit=0.15,
+                contrast_limit=0.15,
                 p=0.15
             ),
-            
-            # Shadows (from uneven lighting)
-            A.RandomShadow(
-                shadow_roi=(0, 0.5, 1, 1),
-                num_shadows_lower=1,
-                num_shadows_upper=2,
-                shadow_dimension=5,
-                p=0.25
-            ),
-            
-            # Compression artifacts (real-world camera)
-            A.ImageCompression(quality_lower=75, quality_upper=100, p=0.2),
-            
-            # Coarse dropout (simulate occlusions)
-            A.CoarseDropout(
-                max_holes=8,
-                max_height=64,
-                max_width=64,
-                min_holes=1,
-                min_height=16,
-                min_width=16,
+            A.RandomToneCurve(scale=0.1, p=0.25),
+            A.ImageCompression(quality_range=(75, 100), p=0.2),
+            A.Erasing(
+                scale=(0.02, 0.08),
+                ratio=(0.3, 3.3),
                 fill_value=0,
                 p=0.1
             ),
-            
-            # Final resize
             A.Resize(image_size, image_size, interpolation=cv2.INTER_LINEAR),
-            
-            # Normalize and convert to tensor
             A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
@@ -322,7 +230,6 @@ class DefectAugmentation:
     
     @staticmethod
     def get_val_transforms(image_size: int = 1024):
-        """Validation transforms (no augmentation)"""
         return A.Compose([
             A.Resize(image_size, image_size, interpolation=cv2.INTER_LINEAR),
             A.Normalize(
@@ -335,7 +242,6 @@ class DefectAugmentation:
     
     @staticmethod
     def get_tta_transforms(image_size: int = 1024):
-        """Test-time augmentation variants"""
         base_transforms = [
             A.Compose([
                 A.Resize(image_size, image_size),
@@ -344,59 +250,46 @@ class DefectAugmentation:
             ]),
         ]
         
-        # Flip variants
-        for flip_code in [0, 1]:  # Horizontal, Vertical
+        for flip_fn in [A.HorizontalFlip, A.VerticalFlip]:
             base_transforms.append(
                 A.Compose([
-                    A.Flip(p=1.0) if flip_code == 1 else A.HorizontalFlip(p=1.0),
+                    flip_fn(p=1.0),
                     A.Resize(image_size, image_size),
                     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                     ToTensorV2(),
                 ])
             )
         
-        # Rotation variants
         for angle in [90, 180, 270]:
             base_transforms.append(
                 A.Compose([
-                    A.Rotate(limit=(angle, angle), border_mode=cv2.BORDER_REFLECT_101, p=1.0),
+                    A.Affine(rotate=(angle, angle), border_mode=cv2.BORDER_REFLECT_101, p=1.0),
                     A.Resize(image_size, image_size),
                     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                     ToTensorV2(),
                 ])
             )
         
-        # Scale variants
         for scale in [0.9, 1.1]:
             base_transforms.append(
                 A.Compose([
-                    A.ShiftScaleRotate(shift_limit=0, scale_limit=(scale-1, scale-1), 
-                                      rotate_limit=0, border_mode=cv2.BORDER_REFLECT_101, p=1.0),
+                    A.Affine(scale=(scale, scale), border_mode=cv2.BORDER_REFLECT_101, p=1.0),
                     A.Resize(image_size, image_size),
                     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                     ToTensorV2(),
                 ])
             )
         
-        return base_transforms[:8]  # Return 8 TTA variants
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                    DEFECT SYNTHESIS (DATA AUGMENTATION)
-# ═══════════════════════════════════════════════════════════════════════════
+        return base_transforms[:8]
 
 class DefectSynthesis:
-    """Synthesize realistic defects by pasting real defects onto clean areas"""
-    
     @staticmethod
     def extract_defect_patches(image: np.ndarray, mask: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Extract defect patches from labeled image"""
         patches = []
         contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            # Add padding
             pad = 20
             x1, y1 = max(0, x - pad), max(0, y - pad)
             x2, y2 = min(image.shape[1], x + w + pad), min(image.shape[0], y + h + pad)
@@ -404,7 +297,7 @@ class DefectSynthesis:
             patch_img = image[y1:y2, x1:x2]
             patch_mask = mask[y1:y2, x1:x2]
             
-            if patch_img.size > 0 and patch_mask.sum() > 100:  # Minimum size
+            if patch_img.size > 0 and patch_mask.sum() > 100:
                 patches.append((patch_img.copy(), patch_mask.copy()))
         
         return patches
@@ -412,23 +305,19 @@ class DefectSynthesis:
     @staticmethod
     def paste_defect(background: np.ndarray, bg_mask: np.ndarray, 
                      defect_patch: np.ndarray, defect_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Paste defect onto background with Poisson blending"""
         h, w = background.shape[:2]
         ph, pw = defect_patch.shape[:2]
         
         if ph >= h or pw >= w:
             return background, bg_mask
         
-        # Random position (avoid existing defects)
         max_attempts = 50
         for _ in range(max_attempts):
             x = np.random.randint(0, w - pw)
             y = np.random.randint(0, h - ph)
             
-            # Check if area is clean
             roi_mask = bg_mask[y:y+ph, x:x+pw]
-            if roi_mask.sum() < 10:  # Mostly clean area
-                # Seamless cloning (Poisson blending)
+            if roi_mask.sum() < 10:
                 try:
                     center = (x + pw // 2, y + ph // 2)
                     result = cv2.seamlessClone(
@@ -436,7 +325,7 @@ class DefectSynthesis:
                         (defect_mask * 255).astype(np.uint8), 
                         center, cv2.NORMAL_CLONE
                     )
-                    # Update mask
+                    
                     bg_mask[y:y+ph, x:x+pw] = np.maximum(bg_mask[y:y+ph, x:x+pw], defect_mask)
                     return result, bg_mask
                 except:
@@ -444,14 +333,7 @@ class DefectSynthesis:
         
         return background, bg_mask
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                         DATASET PREPARATION
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DefectDatasetPreparation:
-    """Intelligent dataset merging with semantic class unification"""
-    
     def __init__(self, config: Config, taxonomy: DefectTaxonomy):
         self.config = config
         self.taxonomy = taxonomy
@@ -462,12 +344,8 @@ class DefectDatasetPreparation:
         }
     
     def merge_datasets(self):
-        """Merge datasets with stratified splitting"""
-        print("\n" + "="*80)
         print("📦 DATASET PREPARATION")
-        print("="*80)
         
-        # Create directory structure
         for split in ['train', 'val', 'test']:
             (self.config.combined_dir / split / 'images').mkdir(parents=True, exist_ok=True)
             (self.config.combined_dir / split / 'masks').mkdir(parents=True, exist_ok=True)
@@ -475,13 +353,11 @@ class DefectDatasetPreparation:
         all_samples = []
         class_distribution = defaultdict(int)
         
-        # Collect all samples
         for door_type, door_dir in self.source_datasets.items():
             if not door_dir.exists():
                 print(f"⚠️  Skipping {door_type}: directory not found")
                 continue
             
-            # Load data.yaml to get class names
             yaml_path = door_dir / 'data.yaml'
             if not yaml_path.exists():
                 print(f"⚠️  No data.yaml for {door_type}")
@@ -492,7 +368,6 @@ class DefectDatasetPreparation:
             
             local_class_names = data_config.get('names', [])
             
-            # Process images
             img_dir = door_dir / 'train' / 'images'
             lbl_dir = door_dir / 'train' / 'labels'
             
@@ -506,7 +381,6 @@ class DefectDatasetPreparation:
                 if not lbl_path.exists():
                     continue
                 
-                # Parse labels to determine dominant class
                 with open(lbl_path, 'r') as f:
                     lines = f.readlines()
                 
@@ -522,7 +396,7 @@ class DefectDatasetPreparation:
                         unified_class = self.taxonomy.map_to_unified(variant_name)
                         dominant_class = unified_class
                         class_distribution[unified_class] += 1
-                        break  # Use first defect as dominant
+                        break
                 
                 if dominant_class:
                     all_samples.append({
@@ -534,36 +408,64 @@ class DefectDatasetPreparation:
                     })
         
         print(f"\n📊 Collected {len(all_samples)} samples")
-        print("\n📈 Class Distribution:")
         for cls, count in sorted(class_distribution.items()):
             print(f"  {cls:20s}: {count:4d} samples")
         
-        # Stratified split
+        if len(all_samples) == 0:
+            print("\n❌ No samples found! Diagnostic info:")
+            for door_type, door_dir in self.source_datasets.items():
+                img_dir = door_dir / 'train' / 'images'
+                lbl_dir = door_dir / 'train' / 'labels'
+                print(f"  {door_type}:")
+                print(f"    dir exists:    {door_dir.exists()}")
+                print(f"    images dir:    {img_dir.exists()}")
+                print(f"    labels dir:    {lbl_dir.exists()}")
+                if img_dir.exists():
+                    imgs = list(img_dir.glob('*.png')) + list(img_dir.glob('*.jpg'))
+                    print(f"    image count:   {len(imgs)}")
+            raise ValueError(
+                f"No samples found in input_dir={self.config.input_dir}. "
+                f"Expected structure: {{input_dir}}/{{black,white,glossy}}/train/images/ and .../labels/"
+            )
+        
         indices = np.arange(len(all_samples))
         stratify_labels = [s['dominant_class'] for s in all_samples]
         
         from sklearn.model_selection import train_test_split
         
-        # First split: train vs temp
-        train_idx, temp_idx = train_test_split(
-            indices,
-            train_size=self.config.train_split,
-            stratify=stratify_labels,
-            random_state=42
-        )
+        try:
+            train_idx, temp_idx = train_test_split(
+                indices,
+                train_size=self.config.train_split,
+                stratify=stratify_labels,
+                random_state=42
+            )
+        except ValueError:
+            print("⚠️  Stratified train split failed (rare classes), using non-stratified")
+            train_idx, temp_idx = train_test_split(
+                indices,
+                train_size=self.config.train_split,
+                random_state=42
+            )
         
-        # Second split: val vs test
         temp_stratify = [stratify_labels[i] for i in temp_idx]
         val_size = self.config.val_split / (self.config.val_split + self.config.test_split)
         
-        val_idx, test_idx = train_test_split(
-            temp_idx,
-            train_size=val_size,
-            stratify=temp_stratify,
-            random_state=42
-        )
+        try:
+            val_idx, test_idx = train_test_split(
+                temp_idx,
+                train_size=val_size,
+                stratify=temp_stratify,
+                random_state=42
+            )
+        except ValueError:
+            print("⚠️  Stratified val/test split failed (rare classes), using non-stratified")
+            val_idx, test_idx = train_test_split(
+                temp_idx,
+                train_size=val_size,
+                random_state=42
+            )
         
-        # Copy files and convert annotations
         splits = {
             'train': train_idx,
             'val': val_idx,
@@ -578,38 +480,30 @@ class DefectDatasetPreparation:
                 img_path = sample['image_path']
                 lbl_path = sample['label_path']
                 
-                # Create unique filename
                 new_name = f"{sample['door_type']}_{img_path.name}"
                 
-                # Copy image
                 dst_img = self.config.combined_dir / split_name / 'images' / new_name
                 shutil.copy(str(img_path), str(dst_img))
                 
-                # Convert label to mask
                 mask = self._label_to_mask(
                     str(lbl_path),
                     img_path,
                     sample['local_class_names']
                 )
                 
-                # Save mask
                 mask_name = f"{sample['door_type']}_{img_path.stem}.png"
                 dst_mask = self.config.combined_dir / split_name / 'masks' / mask_name
                 cv2.imwrite(str(dst_mask), mask)
         
-        # Create data.yaml
         self._create_data_yaml()
         
         print("\n✅ Dataset preparation complete!")
         return self.config.combined_dir / 'data.yaml'
     
     def _label_to_mask(self, label_path: str, img_path: Path, local_class_names: List[str]) -> np.ndarray:
-        """Convert YOLO polygon labels to semantic segmentation mask"""
-        # Load image to get dimensions
         img = cv2.imread(str(img_path))
         h, w = img.shape[:2]
         
-        # Create mask (background = 0, classes = 1, 2, 3, ...)
         mask = np.zeros((h, w), dtype=np.uint8)
         
         with open(label_path, 'r') as f:
@@ -630,7 +524,6 @@ class DefectDatasetPreparation:
             if unified_class_id < 0:
                 continue
             
-            # Parse polygon coordinates
             coords = list(map(float, parts[1:]))
             points = []
             for i in range(0, len(coords), 2):
@@ -640,13 +533,11 @@ class DefectDatasetPreparation:
             
             points = np.array(points, dtype=np.int32)
             
-            # Fill polygon (class_id + 1 because 0 is background)
             cv2.fillPoly(mask, [points], unified_class_id + 1)
         
         return mask
     
     def _create_data_yaml(self):
-        """Create data configuration file"""
         data_config = {
             'path': str(self.config.combined_dir.absolute()),
             'train': 'train',
@@ -662,14 +553,7 @@ class DefectDatasetPreparation:
         
         print(f"\n📄 Created {yaml_path}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                    PYTORCH DATASET WITH ADVANCED CACHING
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DefectDataset(Dataset):
-    """High-performance dataset with caching and augmentation"""
-    
     def __init__(self, image_dir: Path, mask_dir: Path, transform=None, cache: bool = False):
         self.image_paths = sorted(list(image_dir.glob('*.png')) + list(image_dir.glob('*.jpg')))
         self.mask_dir = mask_dir
@@ -687,11 +571,9 @@ class DefectDataset(Dataset):
         img_path = self.image_paths[idx]
         mask_path = self.mask_dir / f"{img_path.stem}.png"
         
-        # Load image
         image = cv2.imread(str(img_path))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Load mask
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         
         if self.transform:
@@ -699,7 +581,6 @@ class DefectDataset(Dataset):
             image = transformed['image']
             mask = transformed['mask']
         
-        # Convert mask to one-hot
         mask = mask.long()
         
         sample = {'image': image, 'mask': mask, 'image_path': str(img_path)}
@@ -709,14 +590,8 @@ class DefectDataset(Dataset):
         
         return sample
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                   STATE-OF-THE-ART MODEL ARCHITECTURE
-# ═══════════════════════════════════════════════════════════════════════════
-
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation block for channel attention"""
-    
     def __init__(self, channels, reduction=16):
         super().__init__()
         self.squeeze = nn.AdaptiveAvgPool2d(1)
@@ -733,131 +608,183 @@ class SEBlock(nn.Module):
         y = self.excitation(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
-
-class SpatialAttention(nn.Module):
-    """Spatial attention module"""
-    
-    def __init__(self, kernel_size=7):
+class DINOv2Encoder(nn.Module):
+    """Frozen DINOv2 Encoder with Multi-Scale Feature Extraction"""
+    def __init__(self, model_name='dinov2_vitb14', pretrained=True):
         super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-    
+        # Load from torch hub
+        self.backbone = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=pretrained)
+        
+        # Freeze all parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
+        self.embed_dim = self.backbone.embed_dim
+        
+        # Projection layers to standard channel counts for FPN [96, 192, 384, 768]
+        self.projections = nn.ModuleList([
+            nn.Conv2d(self.embed_dim, 96, 1),
+            nn.Conv2d(self.embed_dim, 192, 1),
+            nn.Conv2d(self.embed_dim, 384, 1),
+            nn.Conv2d(self.embed_dim, 768, 1),
+        ])
+        
     def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        y = torch.cat([avg_out, max_out], dim=1)
-        y = self.conv(y)
-        return x * self.sigmoid(y)
+        # x: [B, 3, H, W]
+        B, C, H, W = x.shape
+        
+        # Get intermediate layers (3, 6, 9, 12)
+        features_dict = self.backbone.get_intermediate_layers(x, n=4, reshape=True)
+        # features_dict is list of [B, embed_dim, h, w] (1/14 scale if H,W multiples of 14)
+        
+        out_features = []
+        
+        # Level 0: 1/4 scale (upsample)
+        fpn_0 = self.projections[0](features_dict[0])
+        fpn_0 = F.interpolate(fpn_0, size=(H//4, W//4), mode='bilinear', align_corners=False)
+        out_features.append(fpn_0)
+        
+        # Level 1: 1/8 scale (upsample)
+        fpn_1 = self.projections[1](features_dict[1])
+        fpn_1 = F.interpolate(fpn_1, size=(H//8, W//8), mode='bilinear', align_corners=False)
+        out_features.append(fpn_1)
+        
+        # Level 2: 1/16 scale (downsample/upsample depending on input vs 1/14)
+        fpn_2 = self.projections[2](features_dict[2])
+        fpn_2 = F.interpolate(fpn_2, size=(H//16, W//16), mode='bilinear', align_corners=False)
+        out_features.append(fpn_2)
+        
+        # Level 3: 1/32 scale (downsample)
+        fpn_3 = self.projections[3](features_dict[3])
+        fpn_3 = F.interpolate(fpn_3, size=(H//32, W//32), mode='bilinear', align_corners=False)
+        out_features.append(fpn_3)
+        
+        return out_features
 
-
-class DefectAttentionModule(nn.Module):
-    """Dual attention (channel + spatial) for defect features"""
-    
-    def __init__(self, channels):
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+    def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
-        self.channel_attention = SEBlock(channels)
-        self.spatial_attention = SpatialAttention()
-    
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            SEBlock(out_channels) 
+        )
+
     def forward(self, x):
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
+        return self.double_conv(x)
 
+class FPNUNetDecoder(nn.Module):
+    """UNet++ Style Decoder for FPN features"""
+    def __init__(self, num_classes):
+        super().__init__()
+        
+        # Layer 1 (1/16)
+        self.conv_1_0 = DoubleConv(384, 384)
+        self.conv_1_1 = DoubleConv(384 + 768, 384) 
+        
+        # Layer 2 (1/8)
+        self.conv_2_0 = DoubleConv(192, 192)
+        self.conv_2_1 = DoubleConv(192 + 384, 192) 
+        self.conv_2_2 = DoubleConv(192 + 192 + 384, 192) 
+        
+        # Layer 3 (1/4)
+        self.conv_3_0 = DoubleConv(96, 96)
+        self.conv_3_1 = DoubleConv(96 + 192, 96)
+        self.conv_3_2 = DoubleConv(96 + 96 + 192, 96)
+        self.conv_3_3 = DoubleConv(96 + 96 + 96 + 192, 96)
+        
+        # Upsampling
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        
+        # Final segmentation head (from 1/4 scale)
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True), # 1/4 -> 1/1
+            nn.Conv2d(96, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_classes + 1, kernel_size=1)
+        )
+        
+    def forward(self, features):
+        x0, x1, x2, x3 = features # 1/4, 1/8, 1/16, 1/32
+        
+        # 1/16 level
+        x2_0 = x2
+        x2_1 = self.conv_1_1(torch.cat([x2_0, self.up(x3)], dim=1))
+        
+        # 1/8 level
+        x1_0 = x1
+        x1_1 = self.conv_2_1(torch.cat([x1_0, self.up(x2_0)], dim=1))
+        x1_2 = self.conv_2_2(torch.cat([x1_0, x1_1, self.up(x2_1)], dim=1))
+        
+        # 1/4 level
+        x0_0 = x0
+        x0_1 = self.conv_3_1(torch.cat([x0_0, self.up(x1_0)], dim=1))
+        x0_2 = self.conv_3_2(torch.cat([x0_0, x0_1, self.up(x1_1)], dim=1))
+        x0_3 = self.conv_3_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], dim=1))
+        
+        # Output
+        logits = self.final_conv(x0_3)
+        return logits
 
-class UltimateDefectDetector(nn.Module):
-    """
-    State-of-the-art defect detection network combining:
-    - EfficientNet encoder (ImageNet pretrained)
-    - U-Net++ decoder (multi-scale features)
-    - Defect-specific attention modules
-    - Boundary refinement head
-    """
-    
+class DINOv2DefectDetector(nn.Module):
     def __init__(self, config: Config, num_classes: int):
         super().__init__()
         self.config = config
         self.num_classes = num_classes
         
-        # Use segmentation_models_pytorch for best architecture
-        self.model = smp.UnetPlusPlus(
-            encoder_name=config.encoder_name,
-            encoder_weights=config.encoder_weights,
-            in_channels=3,
-            classes=num_classes + 1,  # +1 for background
-            activation=None,  # We'll apply softmax during training
-        )
+        print(f"Loading DINOv2 Encoder: {config.encoder_name}...")
+        self.encoder = DINOv2Encoder(model_name=config.encoder_name)
+        self.decoder = FPNUNetDecoder(num_classes)
         
-        # Get encoder channels
-        if hasattr(self.model.encoder, 'out_channels'):
-            encoder_channels = self.model.encoder.out_channels
-        else:
-            # Default for efficientnet_b4
-            encoder_channels = [3, 24, 32, 56, 160, 448]
-        
-        # Add attention modules to decoder
-        self.attentions = nn.ModuleList([
-            DefectAttentionModule(channels) 
-            for channels in encoder_channels[1:]  # Skip input channels
-        ])
-        
-        # Boundary refinement head
+        # Boundary refinement head (no sigmoid — handled by BCEWithLogitsLoss)
         self.boundary_head = nn.Sequential(
             nn.Conv2d(num_classes + 1, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, 1),
-            nn.Sigmoid()
         )
         
-        # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize decoder weights with He initialization"""
-        for m in self.modules():
+        # Only init decoder and head, encoder is frozen
+        for m in self.decoder.modules():
             if isinstance(m, nn.Conv2d):
-                if m not in self.model.encoder.modules():  # Don't reinit encoder
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                if m not in self.model.encoder.modules():
-                    nn.init.constant_(m.weight, 1)
-                    nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+        for m in self.boundary_head.modules():
+             if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
     
     def forward(self, x, return_boundary=False):
-        """
-        Forward pass with optional boundary prediction
+        features = self.encoder(x)
+        seg_logits = self.decoder(features)
         
-        Args:
-            x: Input tensor [B, 3, H, W]
-            return_boundary: Return boundary map
-        
-        Returns:
-            Segmentation logits [B, num_classes+1, H, W]
-            Boundary map [B, 1, H, W] (optional)
-        """
-        # Main segmentation prediction
-        seg_logits = self.model(x)
+        # Ensure output size matches input size (handling 518 vs 512 mismatches if any)
+        if seg_logits.shape[-2:] != x.shape[-2:]:
+            seg_logits = F.interpolate(seg_logits, size=x.shape[-2:], mode='bilinear', align_corners=False)
         
         if return_boundary:
-            # Predict boundaries
             boundary = self.boundary_head(seg_logits)
             return seg_logits, boundary
         
         return seg_logits
     
     def enable_dropout(self):
-        """Enable dropout for MC Dropout uncertainty estimation"""
-        for m in self.modules():
-            if isinstance(m, nn.Dropout) or isinstance(m, nn.Dropout2d):
-                m.train()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                        ADVANCED LOSS FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
+        pass
 
 class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance"""
     
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
@@ -913,7 +840,7 @@ class BoundaryLoss(nn.Module):
     
     def __init__(self):
         super().__init__()
-        self.bce = nn.BCELoss()
+        self.bce = nn.BCEWithLogitsLoss()
     
     def forward(self, boundary_pred, mask):
         """
@@ -1695,7 +1622,8 @@ def main():
     print("STEP 3: BUILDING STATE-OF-THE-ART MODEL")
     print("="*80)
     
-    model = UltimateDefectDetector(config, taxonomy.get_num_classes())
+    torch.cuda.empty_cache()
+    model = DINOv2DefectDetector(config, taxonomy.get_num_classes())
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -99,7 +99,8 @@ class DoorDefectDataPreparation:
     def _remap_label_file(self, src_label_path: Path, dst_label_path: Path, remap: dict):
         """
         Copy a YOLO label file while remapping class IDs to the unified scheme.
-        Each line: <class_id> <x1> <y1> <x2> <y2> ... (polygon coords)
+        Also converts bbox-format lines (5 values: cls cx cy w h) to
+        polygon-format (cls x1 y1 x2 y2 x3 y3 x4 y4) so YOLOv8-seg can use them.
         """
         with open(src_label_path, 'r') as f:
             lines = f.readlines()
@@ -111,7 +112,19 @@ class DoorDefectDataPreparation:
                 continue
             local_class_id = int(parts[0])
             unified_class_id = remap.get(local_class_id, local_class_id)
-            remapped_lines.append(f"{unified_class_id} {' '.join(parts[1:])}\n")
+
+            if len(parts) == 5:
+                # BBox format: cls cx cy w h → convert to rectangular polygon
+                cx, cy, bw, bh = map(float, parts[1:])
+                x1 = cx - bw / 2
+                y1 = cy - bh / 2
+                x2 = cx + bw / 2
+                y2 = cy + bh / 2
+                remapped_lines.append(f"{unified_class_id} {x1} {y1} {x2} {y1} {x2} {y2} {x1} {y2}\n")
+            elif len(parts) >= 7:
+                # Already polygon format
+                remapped_lines.append(f"{unified_class_id} {' '.join(parts[1:])}\n")
+            # else: skip malformed lines
         
         with open(dst_label_path, 'w') as f:
             f.writelines(remapped_lines)
