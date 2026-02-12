@@ -1,0 +1,164 @@
+# Door Defect Detection System - Dependencies
+# Python 3.8 - 3.11 required
+# Install: pip install -r requirements.txt
+
+# ============================================================================
+# Core Deep Learning Frameworks
+# ============================================================================
+# PyTorch (install separately with CUDA support)
+# For CUDA 11.8: pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu118
+# For CUDA 12.1: pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121
+# For CPU: pip install torch==2.1.0 torchvision==0.16.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ============================================================================
+# YOLOv8 Framework
+# ============================================================================
+ultralytics==8.1.0              # YOLOv8 (includes training, inference, export)
+
+# ============================================================================
+# Computer Vision
+# ============================================================================
+opencv-python==4.8.1.78         # Core OpenCV functionality
+opencv-contrib-python==4.8.1.78 # Additional CV modules (SIFT, SURF, etc.)
+
+# ============================================================================
+# Numerical Computing
+# ============================================================================
+numpy==1.24.3                   # Array operations
+scipy==1.11.3                   # Scientific computing
+numba==0.58.1                   # JIT compilation for speedup
+
+# ============================================================================
+# Image Processing & Augmentation
+# ============================================================================
+albumentations==1.3.1           # Advanced data augmentation
+imgaug==0.4.0                   # Additional augmentations
+Pillow==10.1.0                  # Image I/O
+scikit-image==0.22.0            # Image processing utilities
+
+# ============================================================================
+# Machine Learning Utilities
+# ============================================================================
+scikit-learn==1.3.2            # Train/val split, metrics
+pandas==2.1.3                  # Data manipulation
+pycocotools==2.0.7             # COCO format support (for mAP calculation)
+
+# ============================================================================
+# Visualization
+# ============================================================================
+matplotlib==3.8.2              # Plotting
+seaborn==0.13.0                # Statistical visualization
+plotly==5.18.0                 # Interactive plots (optional)
+
+# ============================================================================
+# Progress Bars & Logging
+# ============================================================================
+tqdm==4.66.1                   # Progress bars
+loguru==0.7.2                  # Advanced logging
+
+# ============================================================================
+# Configuration & Serialization
+# ============================================================================
+pyyaml==6.0.1                  # YAML configuration files
+toml==0.10.2                   # TOML support
+python-dotenv==1.0.0           # Environment variables
+
+# ============================================================================
+# Training Monitoring
+# ============================================================================
+tensorboard==2.15.1            # TensorBoard logging
+# wandb==0.16.1                # Weights & Biases (optional, uncomment if needed)
+# aim==3.17.5                  # Aim experiment tracker (optional)
+
+# ============================================================================
+# Model Export & Optimization
+# ============================================================================
+onnx==1.15.0                   # ONNX format export
+onnxruntime-gpu==1.16.3        # ONNX Runtime with GPU support
+# onnxruntime==1.16.3          # ONNX Runtime CPU-only (alternative)
+onnxsim==0.4.33                # ONNX simplification
+
+# ============================================================================
+# API & Web Server (Optional)
+# ============================================================================
+flask==3.0.0                   # REST API framework
+flask-cors==4.0.0              # CORS support for API
+requests==2.31.0               # HTTP requests
+gunicorn==21.2.0               # Production WSGI server
+
+# ============================================================================
+# Utilities
+# ============================================================================
+psutil==5.9.6                  # System monitoring
+humanize==4.9.0                # Human-readable numbers
+colorama==0.4.6                # Colored terminal output
+termcolor==2.3.0               # Terminal colors
+rich==13.7.0                   # Rich terminal formatting
+
+# ============================================================================
+# Testing (Development)
+# ============================================================================
+pytest==7.4.3                  # Testing framework
+pytest-cov==4.1.0              # Coverage reports
+pytest-mock==3.12.0            # Mocking support
+
+# ============================================================================
+# Code Quality (Development)
+# ============================================================================
+black==23.11.0                 # Code formatting
+flake8==6.1.0                  # Linting
+isort==5.12.0                  # Import sorting
+mypy==1.7.1                    # Type checking
+pylint==3.0.2                  # Advanced linting
+
+# ============================================================================
+# Documentation (Development)
+# ============================================================================
+sphinx==7.2.6                  # Documentation generation
+sphinx-rtd-theme==2.0.0        # ReadTheDocs theme
+
+# ============================================================================
+# Jupyter Notebooks (Development/Analysis)
+# ============================================================================
+jupyter==1.0.0                 # Jupyter notebook
+ipykernel==6.26.0              # IPython kernel
+ipywidgets==8.1.1              # Interactive widgets
+
+# ============================================================================
+# Advanced Optimizations (Optional)
+# ============================================================================
+# openvino-dev==2023.2.0       # Intel OpenVINO (uncomment for Intel hardware)
+# tensorrt==8.6.1              # NVIDIA TensorRT (uncomment for production deployment)
+
+# ============================================================================
+# GPU Monitoring (Optional)
+# ============================================================================
+pynvml==11.5.0                 # NVIDIA GPU monitoring
+gpustat==1.1.1                 # GPU statistics
+
+# ============================================================================
+# Version Information
+# ============================================================================
+# Last updated: 2026-02-12
+# Compatible with Python 3.8, 3.9, 3.10, 3.11
+# CUDA 11.8 or 12.1 recommended for GPU acceleration
+
+# ============================================================================
+# Installation Notes
+# ============================================================================
+# 1. Install PyTorch first with appropriate CUDA version
+# 2. Install requirements: pip install -r requirements.txt
+# 3. Verify installation: python -c "import torch; print(torch.cuda.is_available())"
+# 4. For development, install with: pip install -r requirements.txt -r requirements-dev.txt
+
+# ============================================================================
+# Troubleshooting
+# ============================================================================
+# If encountering conflicts:
+# 1. Create fresh virtual environment
+# 2. Install PyTorch first
+# 3. Install ultralytics (will install some dependencies)
+# 4. Install remaining packages
+# 5. Use: pip install --upgrade pip setuptools wheel
