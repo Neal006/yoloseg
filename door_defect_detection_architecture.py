@@ -946,9 +946,6 @@ class DoorDefectInference:
         """
         Made with Love by Neal Daftary
         """
-        # Initialize YOLOv8 model with loaded weights
-        # Note: For true single-file deployment, we'd need to export to ONNX/TorchScript
-        # This is a simplified version
         print(f"✅ Loaded deployment model from {model_path}")
         print(f"   Classes: {', '.join(self.class_names)}")
         print(f"   Calibration: {self.calibration['pixels_per_mm']:.2f} pixels/mm")
